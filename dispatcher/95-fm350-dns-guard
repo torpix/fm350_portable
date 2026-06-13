@@ -1,0 +1,26 @@
+#!/bin/sh
+
+CONFIG=/etc/fm350-rndis.conf
+LOG=/tmp/fm350-dns-guard.log
+
+log() {
+    printf '%s fm350-dns-guard: %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+}
+
+[ -r "$CONFIG" ] || exit 0
+# shellcheck disable=SC1090
+. "$CONFIG"
+DNS1=${DNS1:-1.1.1.1}
+DNS2=${DNS2:-8.8.8.8}
+DNS3=${DNS3:-9.9.9.9}
+
+if nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx FM350_RNDIS; then
+    {
+        printf 'nameserver %s\n' "$DNS1"
+        printf 'nameserver %s\n' "$DNS2"
+        printf 'nameserver %s\n' "$DNS3"
+    } > /etc/resolv.conf
+    log "DNS enforced: $DNS1 $DNS2 $DNS3"
+fi
+
+exit 0

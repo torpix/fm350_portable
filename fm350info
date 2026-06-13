@@ -1,0 +1,213 @@
+#!/bin/sh
+set -eu
+
+CONFIG=/etc/fm350-rndis.conf
+LOG="/tmp/fm350info-$(id -u).log"
+RAW=no
+JSON=no
+OUT_LOG=""
+
+usage() {
+    printf 'Usage: fm350info [--raw] [--json] [--log /path/file.log]\n' >&2
+    exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --raw) RAW=yes ;;
+        --json) JSON=yes ;;
+        --log)
+            shift
+            [ "$#" -gt 0 ] || usage
+            OUT_LOG=$1
+            ;;
+        *) usage ;;
+    esac
+    shift
+done
+
+log_line() {
+    [ -n "$OUT_LOG" ] || return 0
+    mkdir -p "$(dirname "$OUT_LOG")"
+    printf '%s\n' "$1" >> "$OUT_LOG"
+}
+
+init_log() {
+    : >> "$LOG" 2>/dev/null || LOG="/dev/null"
+}
+
+log() {
+    printf '%s fm350info: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+load_config() {
+    if [ -r "$CONFIG" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG"
+    fi
+    AT_PORT=${AT_PORT:-auto}
+    FM_IF=${FM_IF:-auto}
+}
+
+detect_auto() {
+    if [ "$AT_PORT" = "auto" ] || [ "$FM_IF" = "auto" ]; then
+        detected=$(fm350-detect)
+        det_at=$(printf '%s\n' "$detected" | awk -F= '$1=="AT_PORT"{print $2}')
+        det_if=$(printf '%s\n' "$detected" | awk -F= '$1=="FM_IF"{print $2}')
+        [ "$AT_PORT" != "auto" ] || AT_PORT=$det_at
+        [ "$FM_IF" != "auto" ] || FM_IF=$det_if
+    fi
+}
+
+at_cmd() {
+    cmd=$1
+    [ -c "$AT_PORT" ] || {
+        printf 'ERROR: %s is not a character device\n' "$AT_PORT"
+        return 1
+    }
+    [ -r "$AT_PORT" ] && [ -w "$AT_PORT" ] || {
+        printf 'ERROR: brak uprawnien do %s, uruchom sudo fm350info\n' "$AT_PORT"
+        return 1
+    }
+    tmp_in=$(mktemp)
+    tmp_out=$(mktemp)
+    {
+        printf 'ATE0\r\n'
+        printf '%s\r\n' "$cmd"
+    } > "$tmp_in"
+    log "AT >> $cmd"
+    if timeout 10 atinout "$tmp_in" "$AT_PORT" "$tmp_out" 2>>"$LOG"; then
+        out=$(sed '/^[[:space:]]*$/d; s/\r$//' "$tmp_out")
+        log "AT << $out"
+        printf '%s\n' "$out"
+        rm -f "$tmp_in" "$tmp_out"
+        return 0
+    fi
+    rm -f "$tmp_in" "$tmp_out"
+    printf 'ERROR: timeout/failure for %s\n' "$cmd"
+    return 1
+}
+
+band_name() {
+    case "$1" in
+        101) printf 'LTE B1' ;;
+        103) printf 'LTE B3' ;;
+        107) printf 'LTE B7' ;;
+        120) printf 'LTE B20' ;;
+        128) printf 'LTE B28' ;;
+        501) printf 'NR n1' ;;
+        503) printf 'NR n3' ;;
+        5028) printf 'NR n28' ;;
+        5078) printf 'NR n78' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+interpret_bands() {
+    printf '%s\n' "$1" | grep -Eo '[0-9]{3,4}' | sort -u | while read -r code; do
+        name=$(band_name "$code")
+        [ "$name" = "unknown" ] && continue
+        printf '%s = %s\n' "$code" "$name"
+    done
+}
+
+json_escape() {
+    awk '{
+        gsub(/\\/, "\\\\")
+        gsub(/"/, "\\\"")
+        if (NR > 1) {
+            printf "\\n"
+        }
+        printf "%s", $0
+    }'
+}
+
+init_log
+load_config
+detect_auto
+
+if [ -n "$OUT_LOG" ]; then
+    mkdir -p "$(dirname "$OUT_LOG")"
+fi
+
+CMDS='AT+COPS?
+AT+CEREG?
+AT+CGREG?
+AT+CSQ
+AT+CESQ
+AT+GTCCINFO?
+AT+GTCAINFO?
+AT+GTACT?
+AT+CGACT?
+AT+CGPADDR=1
+AT+CGCONTRDP=1'
+
+if [ "$JSON" = "yes" ]; then
+    printf '{\n'
+    printf '  "at_port": "%s",\n' "$AT_PORT"
+    printf '  "fm_if": "%s",\n' "$FM_IF"
+    first=yes
+    printf '  "at": {\n'
+    printf '%s\n' "$CMDS" | while IFS= read -r cmd; do
+        resp=$(at_cmd "$cmd" || true)
+        esc=$(printf '%s' "$resp" | json_escape)
+        [ "$first" = "yes" ] || printf ',\n'
+        first=no
+        printf '    "%s": "%s"' "$cmd" "$esc"
+    done
+    printf '\n  },\n'
+    linux_addr=$(ip -br addr show "$FM_IF" 2>/dev/null || true)
+    route=$(ip route get 1.1.1.1 2>/dev/null || true)
+    resolv=$(cat /etc/resolv.conf 2>/dev/null || true)
+    printf '  "linux": {\n'
+    printf '    "addr": "%s",\n' "$(printf '%s' "$linux_addr" | json_escape)"
+    printf '    "route_1_1_1_1": "%s",\n' "$(printf '%s' "$route" | json_escape)"
+    printf '    "resolv_conf": "%s"\n' "$(printf '%s' "$resolv" | json_escape)"
+    printf '  }\n'
+    printf '}\n'
+    exit 0
+fi
+
+render_info() {
+    printf 'FM350 NetMonster-light\n'
+    printf 'AT_PORT=%s\nFM_IF=%s\n\n' "$AT_PORT" "$FM_IF"
+    all_resp=""
+    printf '%s\n' "$CMDS" | while IFS= read -r cmd; do
+        resp=$(at_cmd "$cmd" || true)
+        if [ "$RAW" = "yes" ]; then
+            printf '### %s\n%s\n\n' "$cmd" "$resp"
+        else
+            case "$cmd" in
+                AT+COPS\?) title="Operator" ;;
+                AT+CEREG\?) title="Rejestracja EPS/LTE" ;;
+                AT+CGREG\?) title="Rejestracja GPRS" ;;
+                AT+CSQ) title="Sygnał CSQ" ;;
+                AT+CESQ) title="Sygnał CESQ" ;;
+                AT+GTCCINFO\?) title="Komórka/BTS/pasmo" ;;
+                AT+GTCAINFO\?) title="CA/NR" ;;
+                AT+GTACT\?) title="Tryby i pasma" ;;
+                AT+CGACT\?) title="Konteksty aktywne" ;;
+                AT+CGPADDR=1) title="Adres IP" ;;
+                AT+CGCONTRDP=1) title="Dane PDP/APN" ;;
+                *) title="$cmd" ;;
+            esac
+            printf '%s\n%s\n\n' "$title" "$resp"
+        fi
+        all_resp=$(printf '%s\n%s\n' "$all_resp" "$resp")
+        if [ "$cmd" = "AT+GTACT?" ] || [ "$cmd" = "AT+GTCCINFO?" ] || [ "$cmd" = "AT+GTCAINFO?" ]; then
+            interp=$(interpret_bands "$resp")
+            [ -z "$interp" ] || printf 'Interpretacja pasm\n%s\n\n' "$interp"
+        fi
+    done
+    printf 'Linux\n'
+    ip -br addr show "$FM_IF" 2>/dev/null || true
+    ip route get 1.1.1.1 2>/dev/null || true
+    printf '\nDNS\n'
+    cat /etc/resolv.conf 2>/dev/null || true
+}
+
+if [ -n "$OUT_LOG" ]; then
+    render_info | tee "$OUT_LOG"
+else
+    render_info
+fi

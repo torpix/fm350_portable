@@ -1,0 +1,15 @@
+*.log
+*.tmp
+*.bak
+*.tar.gz
+*.zip
+**PASS**.txt
+fm350_pomiary/
+logs/
+.cache/
+.env
+*.key
+*.pem
+*.crt
+*.sqlite
+*.db

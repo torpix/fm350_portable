@@ -1,0 +1,92 @@
+#!/bin/sh
+set -eu
+
+CONFIG=/etc/fm350-rndis.conf
+LOG=/tmp/fm350-rndis.log
+LOCK=/run/fm350-rndis.lock
+RESOLV=/etc/resolv.conf
+RESOLV_BAK=/run/fm350-resolv.conf.bak
+
+log() {
+    printf '%s fm350-disconnect: %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+}
+
+die() {
+    log "ERROR: $*"
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+load_config() {
+    [ -r "$CONFIG" ] || die "Missing $CONFIG"
+    # shellcheck disable=SC1090
+    . "$CONFIG"
+    AT_PORT=${AT_PORT:-auto}
+    FM_IF=${FM_IF:-auto}
+}
+
+detect_auto() {
+    if [ "$AT_PORT" = "auto" ] || [ "$FM_IF" = "auto" ]; then
+        detected=$(fm350-detect)
+        det_at=$(printf '%s\n' "$detected" | awk -F= '$1=="AT_PORT"{print $2}')
+        det_if=$(printf '%s\n' "$detected" | awk -F= '$1=="FM_IF"{print $2}')
+        [ "$AT_PORT" != "auto" ] || AT_PORT=$det_at
+        [ "$FM_IF" != "auto" ] || FM_IF=$det_if
+    fi
+}
+
+at_cmd_no_die() {
+    cmd=$1
+    [ -c "$AT_PORT" ] || {
+        log "$AT_PORT is not a character device, skipping AT $cmd"
+        return 1
+    }
+    tmp_in=$(mktemp)
+    tmp_out=$(mktemp)
+    {
+        printf 'ATE0\r\n'
+        printf '%s\r\n' "$cmd"
+    } > "$tmp_in"
+    log "AT >> $cmd"
+    if timeout 10 atinout "$tmp_in" "$AT_PORT" "$tmp_out" 2>>"$LOG"; then
+        out=$(sed '/^[[:space:]]*$/d; s/\r$//' "$tmp_out")
+        log "AT << $out"
+        printf '%s\n' "$out"
+        rm -f "$tmp_in" "$tmp_out"
+        return 0
+    fi
+    rm -f "$tmp_in" "$tmp_out"
+    return 1
+}
+
+do_disconnect() {
+    load_config
+    detect_auto
+
+    if [ "$FM_IF" != "auto" ] && [ -d "/sys/class/net/$FM_IF" ]; then
+        ip route del default dev "$FM_IF" 2>>"$LOG" || true
+        ip addr flush dev "$FM_IF" 2>>"$LOG" || true
+    else
+        log "FM_IF not available, skipping Linux interface cleanup"
+    fi
+
+    if [ "$AT_PORT" != "auto" ]; then
+        resp=$(at_cmd_no_die "AT+CGACT=0,1" || true)
+        if printf '%s\n' "$resp" | grep -q '+CGEV: ME PDN DEACT 1'; then
+            log "PDN deactivation event received"
+        fi
+    fi
+
+    if [ -e "$RESOLV_BAK" ]; then
+        cp -a "$RESOLV_BAK" "$RESOLV" 2>>"$LOG" || true
+        rm -f "$RESOLV_BAK" 2>>"$LOG" || true
+    fi
+
+    log "DOWN done"
+}
+
+mkdir -p /run
+(
+    flock -n 9 || die "Another fm350 operation is running"
+    do_disconnect
+) 9>"$LOCK"

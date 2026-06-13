@@ -1,0 +1,189 @@
+#!/bin/sh
+set -eu
+
+CONFIG=/etc/fm350-rndis.conf
+LOG=/tmp/fm350-rndis.log
+
+log() {
+    printf '%s fm350-detect: %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+}
+
+die() {
+    log "ERROR: $*"
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+at_raw() {
+    port=$1
+    cmd=$2
+
+    [ -c "$port" ] || die "$port is not a character device"
+    tmp_in=$(mktemp)
+    tmp_out=$(mktemp)
+    {
+        printf 'ATE0\r\n'
+        printf '%s\r\n' "$cmd"
+    } > "$tmp_in"
+
+    if timeout 5 atinout "$tmp_in" "$port" "$tmp_out" 2>>"$LOG"; then
+        sed '/^[[:space:]]*$/d; s/\r$//' "$tmp_out"
+        rm -f "$tmp_in" "$tmp_out"
+        return 0
+    fi
+
+    rm -f "$tmp_in" "$tmp_out"
+    return 1
+}
+
+find_usb_id_sysfs() {
+    for dev in /sys/bus/usb/devices/*; do
+        [ -r "$dev/idVendor" ] && [ -r "$dev/idProduct" ] || continue
+        vendor=$(cat "$dev/idVendor" 2>/dev/null || true)
+        product=$(cat "$dev/idProduct" 2>/dev/null || true)
+        case "$vendor:$product" in
+            0e8d:7127|0e8d:7126)
+                printf '%s:%s\n' "$vendor" "$product"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+usb_id=$(find_usb_id_sysfs || true)
+if [ -z "$usb_id" ] && command -v lsusb >/dev/null 2>&1; then
+    if lsusb -d 0e8d:7127 >/dev/null 2>&1; then
+        usb_id="0e8d:7127"
+    elif lsusb -d 0e8d:7126 >/dev/null 2>&1; then
+        usb_id="0e8d:7126"
+    fi
+fi
+
+[ -n "$usb_id" ] || log "FM350 USB ID 0e8d:7127/7126 not found by lsusb"
+
+at_port=""
+gtusbmode=""
+for port in /dev/ttyUSB*; do
+    [ -e "$port" ] || continue
+    if [ ! -c "$port" ]; then
+        log "Skipping non-character $port"
+        continue
+    fi
+
+    ati=$(at_raw "$port" "ATI" 2>/dev/null || true)
+    mode=$(at_raw "$port" "AT+GTUSBMODE?" 2>/dev/null || true)
+    log "Probe $port ATI=[$ati] GTUSBMODE=[$mode]"
+
+    if printf '%s\n%s\n' "$ati" "$mode" | grep -Eiq 'FM350|Fibocom|GTUSBMODE'; then
+        at_port=$port
+        gtusbmode=$(printf '%s\n' "$mode" | awk -F: '/GTUSBMODE/ {gsub(/[ ,\r]/,"",$2); print $2; exit}')
+        break
+    fi
+done
+
+find_if_by_usb() {
+    target_product=$1
+    for iface_path in /sys/class/net/*; do
+        [ -e "$iface_path" ] || continue
+        iface=${iface_path##*/}
+        [ "$iface" = "lo" ] && continue
+        dev=$(readlink -f "$iface_path/device" 2>/dev/null || true)
+        [ -n "$dev" ] || continue
+        cur=$dev
+        while [ "$cur" != "/" ] && [ -n "$cur" ]; do
+            if [ -r "$cur/idVendor" ] && [ -r "$cur/idProduct" ]; then
+                vendor=$(cat "$cur/idVendor" 2>/dev/null || true)
+                product=$(cat "$cur/idProduct" 2>/dev/null || true)
+                if [ "$vendor:$product" = "0e8d:$target_product" ]; then
+                    printf '%s\n' "$iface"
+                    return 0
+                fi
+            fi
+            cur=${cur%/*}
+        done
+    done
+    return 1
+}
+
+find_if_by_mac() {
+    for iface_path in /sys/class/net/*; do
+        [ -e "$iface_path" ] || continue
+        iface=${iface_path##*/}
+        [ "$iface" = "lo" ] && continue
+        mac=$(cat "$iface_path/address" 2>/dev/null || true)
+        if [ "$mac" = "00:00:11:12:13:14" ]; then
+            printf '%s\n' "$iface"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_if_fallback() {
+    for iface_path in /sys/class/net/*; do
+        [ -e "$iface_path" ] || continue
+        iface=${iface_path##*/}
+        [ "$iface" = "lo" ] && continue
+        type=$(cat "$iface_path/type" 2>/dev/null || true)
+        [ "$type" = "1" ] || continue
+        dev=$(readlink -f "$iface_path/device" 2>/dev/null || true)
+        printf '%s' "$dev" | grep -qi usb || continue
+        if ! ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet '; then
+            printf '%s\n' "$iface"
+            return 0
+        fi
+    done
+    return 1
+}
+
+fm_if=""
+if [ "$usb_id" = "0e8d:7127" ]; then
+    fm_if=$(find_if_by_usb 7127 || true)
+elif [ "$usb_id" = "0e8d:7126" ]; then
+    fm_if=$(find_if_by_usb 7126 || true)
+fi
+[ -n "$fm_if" ] || fm_if=$(find_if_by_mac || true)
+if [ -z "$fm_if" ] && { [ -n "$usb_id" ] || [ -n "$at_port" ]; }; then
+    fm_if=$(find_if_fallback || true)
+fi
+
+printf 'AT_PORT=%s\n' "${at_port:-auto}"
+printf 'FM_IF=%s\n' "${fm_if:-auto}"
+printf 'USB_ID=%s\n' "${usb_id:-unknown}"
+printf 'GTUSBMODE=%s\n' "${gtusbmode:-unknown}"
+
+if [ "${1:-}" = "--write-config" ]; then
+    [ "$(id -u)" -eq 0 ] || die "--write-config requires root"
+    old_apn=internet
+    old_dns1=1.1.1.1
+    old_dns2=8.8.8.8
+    old_dns3=9.9.9.9
+    old_metric=100
+    old_auto=yes
+    old_mm=yes
+    if [ -r "$CONFIG" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG"
+        old_apn=${APN:-$old_apn}
+        old_dns1=${DNS1:-$old_dns1}
+        old_dns2=${DNS2:-$old_dns2}
+        old_dns3=${DNS3:-$old_dns3}
+        old_metric=${ROUTE_METRIC:-$old_metric}
+        old_auto=${AUTOCONNECT:-$old_auto}
+        old_mm=${DISABLE_MODEMMANAGER_FOR_FM350:-$old_mm}
+    fi
+    umask 022
+    {
+        printf 'FM_IF="%s"\n' "${fm_if:-auto}"
+        printf 'AT_PORT="%s"\n' "${at_port:-auto}"
+        printf 'APN="%s"\n' "$old_apn"
+        printf 'DNS1="%s"\n' "$old_dns1"
+        printf 'DNS2="%s"\n' "$old_dns2"
+        printf 'DNS3="%s"\n' "$old_dns3"
+        printf 'ROUTE_METRIC="%s"\n' "$old_metric"
+        printf 'AUTOCONNECT="%s"\n' "$old_auto"
+        printf 'DISABLE_MODEMMANAGER_FOR_FM350="%s"\n' "$old_mm"
+    } > "$CONFIG"
+    log "Wrote $CONFIG"
+fi
