@@ -18,13 +18,15 @@ die() {
 }
 
 load_config() {
-    [ -r "$CONFIG" ] || die "Missing $CONFIG"
-    # shellcheck disable=SC1090
-    . "$CONFIG"
+    if [ -r "$CONFIG" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG"
+    fi
     APN=${APN:-internet}
     DNS1=${DNS1:-1.1.1.1}
     DNS2=${DNS2:-8.8.8.8}
     DNS3=${DNS3:-9.9.9.9}
+    MANAGE_DNS=${MANAGE_DNS:-yes}
     ROUTE_METRIC=${ROUTE_METRIC:-100}
     AT_PORT=${AT_PORT:-auto}
     FM_IF=${FM_IF:-auto}
@@ -42,7 +44,8 @@ detect_auto() {
 
 at_cmd() {
     cmd=$1
-    [ -c "$AT_PORT" ] || die "$AT_PORT is not a character device"
+    sec=${2:-10}
+    [ -c "$AT_PORT" ] || return 1
     tmp_in=$(mktemp)
     tmp_out=$(mktemp)
     {
@@ -50,7 +53,7 @@ at_cmd() {
         printf '%s\r\n' "$cmd"
     } > "$tmp_in"
     log "AT >> $cmd"
-    if timeout 10 atinout "$tmp_in" "$AT_PORT" "$tmp_out" 2>>"$LOG"; then
+    if timeout "$sec" atinout "$tmp_in" "$AT_PORT" "$tmp_out" 2>>"$LOG"; then
         out=$(sed '/^[[:space:]]*$/d; s/\r$//' "$tmp_out")
         log "AT << $out"
         printf '%s\n' "$out"
@@ -58,7 +61,68 @@ at_cmd() {
         return 0
     fi
     rm -f "$tmp_in" "$tmp_out"
-    die "AT command timed out or failed: $cmd"
+    log "AT timeout/fail: $cmd"
+    return 1
+}
+
+at_probe_once() {
+    cmd=$1
+    tmp_in=$(mktemp)
+    tmp_out=$(mktemp)
+    printf '%s\r\n' "$cmd" > "$tmp_in"
+    log "AT_PROBE >> $cmd"
+    if timeout 8 atinout "$tmp_in" "$AT_PORT" "$tmp_out" 2>>"$LOG"; then
+        out=$(sed '/^[[:space:]]*$/d; s/\r$//' "$tmp_out")
+        log "AT_PROBE << $out"
+        if printf '%s\n' "$out" | grep -q '^OK$'; then
+            rc=0
+        else
+            rc=1
+        fi
+        rm -f "$tmp_in" "$tmp_out"
+        return "$rc"
+    fi
+    rm -f "$tmp_in" "$tmp_out"
+    return 1
+}
+
+at_probe() {
+    [ -c "$AT_PORT" ] || die "$AT_PORT is not a character device"
+    stty -F "$AT_PORT" 115200 raw -echo -echoe -echok -echoctl -echoke -ixon -ixoff 2>>"$LOG" || true
+
+    cycle=1
+    while [ "$cycle" -le 3 ]; do
+        ok=0
+        at_probe_once "AT" && ok=1
+        sleep 1
+        at_probe_once "ATE0" && ok=1
+        at_probe_once "AT" && ok=1
+        if [ "$ok" -eq 1 ]; then
+            log "AT_PROBE_OK cycle=$cycle"
+            return 0
+        fi
+        sleep 1
+        cycle=$((cycle + 1))
+    done
+
+    log "AT_PROBE_FAIL"
+    printf 'ERROR: AT_PROBE_FAIL\n' >&2
+    return 1
+}
+
+at_required() {
+    cmd=$1
+    resp=$(at_cmd "$cmd" "${2:-20}") || die "AT command timed out or failed: $cmd"
+    printf '%s\n' "$resp" | grep -q '^OK$' || die "AT command did not return OK: $cmd"
+    printf '%s\n' "$resp"
+}
+
+diag_warn() {
+    label=$1
+    cmd=$2
+    if ! at_cmd "$cmd" 8 >/dev/null; then
+        log "$label"
+    fi
 }
 
 extract_ipv4() {
@@ -83,39 +147,55 @@ do_connect() {
     [ -d "/sys/class/net/$FM_IF" ] || die "Network interface $FM_IF not found"
     [ -c "$AT_PORT" ] || die "$AT_PORT is not a character device"
 
-    at_cmd "AT+CFUN?" >/dev/null || true
-    at_cmd "AT+CEREG?" >/dev/null || true
-    at_cmd "AT+CGDCONT=1,\"IP\",\"$APN\",\"\",0,0" >/dev/null
-    at_cmd "AT+CGACT=1,1" >/dev/null
+    at_probe || exit 1
+
+    diag_warn "DIAG_WARN_CFUN" "AT+CFUN?"
+    diag_warn "DIAG_WARN_CEREG" "AT+CEREG?"
+    diag_warn "DIAG_WARN_C5GREG" "AT+C5GREG?"
+    diag_warn "DIAG_WARN_CGATT" "AT+CGATT?"
+
+    at_required "AT+CGDCONT=1,\"IPV4V6\",\"$APN\"" 20 >/dev/null
+    at_required "AT+CGACT=1,1" 45 >/dev/null
+    log "PDP_ACT_OK"
 
     ip_addr=""
     i=1
     while [ "$i" -le 12 ]; do
         resp=$(at_cmd "AT+CGPADDR=1" || true)
-        ip_addr=$(printf '%s\n' "$resp" | extract_ipv4 | head -n 1)
+        ip_addr=$(printf '%s\n' "$resp" | awk '/^\+CGPADDR: 1,/ {print}' | extract_ipv4 | head -n 1)
         [ -n "$ip_addr" ] && break
         sleep 5
         i=$((i + 1))
     done
-    [ -n "$ip_addr" ] || die "No IPv4 address from AT+CGPADDR=1"
+    if [ -n "$ip_addr" ]; then
+        log "CGPADDR_IPV4_OK ip=$ip_addr"
+    else
+        log "CGPADDR_NO_IPV4"
+        die "No fresh IPv4 address from AT+CGPADDR=1"
+    fi
 
-    ip link set "$FM_IF" up
-    ip addr flush dev "$FM_IF"
-    ip addr add "$ip_addr/32" dev "$FM_IF"
-    ip route replace default dev "$FM_IF" metric "$ROUTE_METRIC"
+    ip link set "$FM_IF" up || die "Failed to set $FM_IF up"
+    ip addr flush dev "$FM_IF" || die "Failed to flush $FM_IF addresses"
+    ip addr add "$ip_addr/32" dev "$FM_IF" || die "Failed to add $ip_addr/32 to $FM_IF"
+    ip route replace default dev "$FM_IF" metric "$ROUTE_METRIC" || die "Failed to set default route via $FM_IF"
+    log "ROUTE_SET_OK if=$FM_IF ip=$ip_addr metric=$ROUTE_METRIC"
 
     ethtool -K "$FM_IF" gro off gso off tso off >>"$LOG" 2>&1 || true
 
-    if [ -e "$RESOLV" ] && [ ! -e "$RESOLV_BAK" ]; then
-        cp -a "$RESOLV" "$RESOLV_BAK" 2>>"$LOG" || true
+    if [ "$MANAGE_DNS" = "yes" ]; then
+        if [ -e "$RESOLV" ] && [ ! -e "$RESOLV_BAK" ]; then
+            cp -a "$RESOLV" "$RESOLV_BAK" 2>>"$LOG" || true
+        fi
+        {
+            printf 'nameserver %s\n' "$DNS1"
+            printf 'nameserver %s\n' "$DNS2"
+            printf 'nameserver %s\n' "$DNS3"
+        } > "$RESOLV"
+    else
+        log "DNS_MANAGE_DISABLED"
     fi
-    {
-        printf 'nameserver %s\n' "$DNS1"
-        printf 'nameserver %s\n' "$DNS2"
-        printf 'nameserver %s\n' "$DNS3"
-    } > "$RESOLV"
 
-    log "UP done IF=$FM_IF IP=$ip_addr APN=$APN DNS=$DNS1,$DNS2,$DNS3 metric=$ROUTE_METRIC"
+    log "UP done IF=$FM_IF IP=$ip_addr APN=$APN DNS=$DNS1,$DNS2,$DNS3 manage_dns=$MANAGE_DNS metric=$ROUTE_METRIC"
 }
 
 mkdir -p /run

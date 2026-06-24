@@ -36,6 +36,31 @@ at_raw() {
     return 1
 }
 
+udev_value() {
+    port=$1
+    key=$2
+    command -v udevadm >/dev/null 2>&1 || return 1
+    udevadm info -q property -n "$port" 2>/dev/null | awk -F= -v key="$key" '$1 == key {print $2; exit}'
+}
+
+is_dell_dw5821e_port() {
+    port=$1
+    vendor=$(udev_value "$port" ID_VENDOR_ID || true)
+    product=$(udev_value "$port" ID_MODEL_ID || true)
+    [ "$vendor:$product" = "413c:81d7" ]
+}
+
+is_fm350_at_port() {
+    port=$1
+    vendor=$(udev_value "$port" ID_VENDOR_ID || true)
+    product=$(udev_value "$port" ID_MODEL_ID || true)
+    iface=$(udev_value "$port" ID_USB_INTERFACE_NUM || true)
+    case "$vendor:$product:$iface" in
+        0e8d:7127:06|0e8d:7126:06) return 0 ;;
+    esac
+    return 1
+}
+
 find_usb_id_sysfs() {
     for dev in /sys/bus/usb/devices/*; do
         [ -r "$dev/idVendor" ] && [ -r "$dev/idProduct" ] || continue
@@ -64,10 +89,25 @@ fi
 
 at_port=""
 gtusbmode=""
+if [ -c /dev/fm350-at ]; then
+    at_port=/dev/fm350-at
+    mode=$(at_raw "$at_port" "AT+GTUSBMODE?" 2>/dev/null || true)
+    gtusbmode=$(printf '%s\n' "$mode" | awk -F: '/GTUSBMODE/ {gsub(/[ ,\r]/,"",$2); print $2; exit}')
+fi
+
 for port in /dev/ttyUSB*; do
+    [ -z "$at_port" ] || break
     [ -e "$port" ] || continue
     if [ ! -c "$port" ]; then
         log "Skipping non-character $port"
+        continue
+    fi
+    if is_dell_dw5821e_port "$port"; then
+        log "Skipping Dell DW5821e $port"
+        continue
+    fi
+    if ! is_fm350_at_port "$port"; then
+        log "Skipping non-FM350 AT $port"
         continue
     fi
 
@@ -162,6 +202,7 @@ if [ "${1:-}" = "--write-config" ]; then
     old_metric=100
     old_auto=yes
     old_mm=yes
+    old_manage_dns=yes
     if [ -r "$CONFIG" ]; then
         # shellcheck disable=SC1090
         . "$CONFIG"
@@ -172,6 +213,7 @@ if [ "${1:-}" = "--write-config" ]; then
         old_metric=${ROUTE_METRIC:-$old_metric}
         old_auto=${AUTOCONNECT:-$old_auto}
         old_mm=${DISABLE_MODEMMANAGER_FOR_FM350:-$old_mm}
+        old_manage_dns=${MANAGE_DNS:-$old_manage_dns}
     fi
     umask 022
     {
@@ -181,6 +223,7 @@ if [ "${1:-}" = "--write-config" ]; then
         printf 'DNS1="%s"\n' "$old_dns1"
         printf 'DNS2="%s"\n' "$old_dns2"
         printf 'DNS3="%s"\n' "$old_dns3"
+        printf 'MANAGE_DNS="%s"\n' "$old_manage_dns"
         printf 'ROUTE_METRIC="%s"\n' "$old_metric"
         printf 'AUTOCONNECT="%s"\n' "$old_auto"
         printf 'DISABLE_MODEMMANAGER_FOR_FM350="%s"\n' "$old_mm"

@@ -18,11 +18,13 @@ die() {
 }
 
 load_config() {
-    [ -r "$CONFIG" ] || die "Missing $CONFIG"
-    # shellcheck disable=SC1090
-    . "$CONFIG"
+    if [ -r "$CONFIG" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG"
+    fi
     AT_PORT=${AT_PORT:-auto}
     FM_IF=${FM_IF:-auto}
+    MANAGE_DNS=${MANAGE_DNS:-yes}
 }
 
 detect_auto() {
@@ -33,6 +35,40 @@ detect_auto() {
         [ "$AT_PORT" != "auto" ] || AT_PORT=$det_at
         [ "$FM_IF" != "auto" ] || FM_IF=$det_if
     fi
+}
+
+is_fm350_if() {
+    iface=$1
+    [ -d "/sys/class/net/$iface" ] || return 1
+
+    mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null || true)
+    [ "$mac" = "00:00:11:12:13:14" ] && return 0
+
+    dev=$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null || true)
+    while [ -n "$dev" ] && [ "$dev" != "/" ]; do
+        if [ -r "$dev/idVendor" ] && [ -r "$dev/idProduct" ]; then
+            vendor=$(cat "$dev/idVendor" 2>/dev/null || true)
+            product=$(cat "$dev/idProduct" 2>/dev/null || true)
+            if [ "$vendor" = "0e8d" ] && { [ "$product" = "7127" ] || [ "$product" = "7126" ]; }; then
+                return 0
+            fi
+        fi
+        dev=$(dirname "$dev")
+    done
+
+    return 1
+}
+
+detect_fm350_if_by_mac() {
+    for path in /sys/class/net/*; do
+        [ -e "$path/address" ] || continue
+        iface=$(basename "$path")
+        if is_fm350_if "$iface"; then
+            printf '%s\n' "$iface"
+            return 0
+        fi
+    done
+    return 1
 }
 
 at_cmd_no_die() {
@@ -63,11 +99,19 @@ do_disconnect() {
     load_config
     detect_auto
 
-    if [ "$FM_IF" != "auto" ] && [ -d "/sys/class/net/$FM_IF" ]; then
+    if { [ "$FM_IF" = "auto" ] || ! is_fm350_if "$FM_IF"; }; then
+        detected_if=$(detect_fm350_if_by_mac || true)
+        if [ -n "$detected_if" ]; then
+            FM_IF=$detected_if
+        fi
+    fi
+
+    if [ "$FM_IF" != "auto" ] && is_fm350_if "$FM_IF"; then
         ip route del default dev "$FM_IF" 2>>"$LOG" || true
         ip addr flush dev "$FM_IF" 2>>"$LOG" || true
+        log "FM350 interface cleanup done IF=$FM_IF"
     else
-        log "FM_IF not available, skipping Linux interface cleanup"
+        log "FM350 interface not available/validated, skipping Linux interface cleanup"
     fi
 
     if [ "$AT_PORT" != "auto" ]; then
@@ -77,9 +121,13 @@ do_disconnect() {
         fi
     fi
 
-    if [ -e "$RESOLV_BAK" ]; then
-        cp -a "$RESOLV_BAK" "$RESOLV" 2>>"$LOG" || true
-        rm -f "$RESOLV_BAK" 2>>"$LOG" || true
+    if [ "$MANAGE_DNS" = "yes" ]; then
+        if [ -e "$RESOLV_BAK" ]; then
+            cp -a "$RESOLV_BAK" "$RESOLV" 2>>"$LOG" || true
+            rm -f "$RESOLV_BAK" 2>>"$LOG" || true
+        fi
+    else
+        log "DNS_MANAGE_DISABLED"
     fi
 
     log "DOWN done"

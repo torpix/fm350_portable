@@ -5,9 +5,10 @@ set -l CONFIG /etc/fm350-rndis.conf
 set -l TIMESTAMP (date +%Y%m%d_%H%M)
 set -l AUTOCONNECT yes
 set -l MASK_MM no
+set -l MANAGE_DNS yes
 
 function usage
-    echo "Usage: sudo ./install_fm350.fish [--autoconnect yes|no] [--mask-modemmanager]"
+    echo "Usage: sudo ./install_fm350.fish [--autoconnect yes|no] [--manage-dns yes|no] [--mask-modemmanager]"
     exit 2
 end
 
@@ -18,6 +19,11 @@ while test $i -le (count $argv)
             set i (math $i + 1)
             test $i -le (count $argv); or usage
             set AUTOCONNECT $argv[$i]
+        case --manage-dns
+            set i (math $i + 1)
+            test $i -le (count $argv); or usage
+            set MANAGE_DNS $argv[$i]
+            contains -- "$MANAGE_DNS" yes no; or usage
         case --mask-modemmanager
             set MASK_MM yes
         case '*'
@@ -92,6 +98,8 @@ printf '%s\n' \
     'SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", ATTR{idProduct}=="7126", ENV{ID_MM_DEVICE_IGNORE}="1"' \
     'SUBSYSTEM=="tty", ATTRS{idVendor}=="0e8d", ATTRS{idProduct}=="7127", ENV{ID_MM_DEVICE_IGNORE}="1"' \
     'SUBSYSTEM=="tty", ATTRS{idVendor}=="0e8d", ATTRS{idProduct}=="7126", ENV{ID_MM_DEVICE_IGNORE}="1"' \
+    'ACTION=="add|change", SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="0e8d", ENV{ID_MODEL_ID}=="7127", ENV{ID_USB_INTERFACE_NUM}=="06", SYMLINK+="fm350-at"' \
+    'ACTION=="add|change", SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="0e8d", ENV{ID_MODEL_ID}=="7126", ENV{ID_USB_INTERFACE_NUM}=="06", SYMLINK+="fm350-at"' \
     'LABEL="fm350_mm_end"' \
     >/etc/udev/rules.d/78-fm350-modemmanager.rules
 
@@ -128,6 +136,7 @@ if not test -e "$CONFIG"
         'DNS1="1.1.1.1"' \
         'DNS2="8.8.8.8"' \
         'DNS3="9.9.9.9"' \
+        "MANAGE_DNS=\"$MANAGE_DNS\"" \
         'ROUTE_METRIC="100"' \
         "AUTOCONNECT=\"$AUTOCONNECT\"" \
         'DISABLE_MODEMMANAGER_FOR_FM350="yes"' \
@@ -138,6 +147,11 @@ end
 
 if test -r "$CONFIG"
     sed -i "s/^AUTOCONNECT=.*/AUTOCONNECT=\"$AUTOCONNECT\"/" "$CONFIG"
+    if grep -q '^MANAGE_DNS=' "$CONFIG"
+        sed -i "s/^MANAGE_DNS=.*/MANAGE_DNS=\"$MANAGE_DNS\"/" "$CONFIG"
+    else
+        printf 'MANAGE_DNS="%s"\n' "$MANAGE_DNS" >>"$CONFIG"
+    end
     set -l detected_if (awk -F= '$1=="FM_IF"{gsub(/"/,"",$2); print $2}' "$CONFIG")
     if test -n "$detected_if"; and test "$detected_if" != auto
         nmcli connection modify FM350_RNDIS connection.interface-name "$detected_if" 2>/dev/null; or true

@@ -50,6 +50,9 @@ load_config() {
 }
 
 detect_auto() {
+    if [ "$AT_PORT" = "auto" ] && [ -c /dev/fm350-at ]; then
+        AT_PORT=/dev/fm350-at
+    fi
     if [ "$AT_PORT" = "auto" ] || [ "$FM_IF" = "auto" ]; then
         detected=$(fm350-detect)
         det_at=$(printf '%s\n' "$detected" | awk -F= '$1=="AT_PORT"{print $2}')
@@ -78,7 +81,6 @@ at_cmd() {
     log "AT >> $cmd"
     if timeout 10 atinout "$tmp_in" "$AT_PORT" "$tmp_out" 2>>"$LOG"; then
         out=$(sed '/^[[:space:]]*$/d; s/\r$//' "$tmp_out")
-        log "AT << $out"
         printf '%s\n' "$out"
         rm -f "$tmp_in" "$tmp_out"
         return 0
