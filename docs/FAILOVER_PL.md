@@ -1,4 +1,4 @@
-# FM350 -> LAN: jednokierunkowy failover po ~60 s
+# FM350 -> LAN: jednokierunkowy failover po 3 nieudanych testach
 
 ## Cel
 
@@ -10,11 +10,15 @@ Watchdog `fm350-failover` ma temu zapobiec.
 
 - działa tylko wtedy, gdy FM350 jest aktualną trasą domyślną;
 - wykrywa aktualny interfejs FM350 przez `fm350-detect` (bez stałej nazwy typu `enp0s20f0u3`);
-- co 15 s wykonuje mały test ICMP przez interfejs FM350;
+- co 20 s wykonuje mały test ICMP przez interfejs FM350;
 - testuje `1.1.1.1`, a następnie `9.9.9.9`;
-- krótkie zawieszenia 5G nie powodują natychmiastowego przełączenia;
-- po około 60 s ciągłej niedostępności i przy istnieniu alternatywnej trasy domyślnej usuwa wyłącznie trasę `default` przez FM350;
+- PASS nie jest logowany;
+- pierwszy FAIL zapisuje tylko pojedynczy wpis `SUSPECT`;
+- drugi kolejny FAIL nie jest logowany;
+- trzeci kolejny FAIL powoduje failover, jeżeli istnieje alternatywna trasa domyślna;
+- failover usuwa wyłącznie trasę `default` przez FM350;
 - Linux przechodzi wtedy na istniejący LAN (w aktualnej konfiguracji P7510 LAN ma niższą metrykę niż Wi-Fi);
+- po wykonaniu failoveru zapisywany jest pojedynczy wpis końcowy z nową trasą;
 - watchdog nie wykonuje automatycznego powrotu na 5G.
 
 Powrót na FM350 jest ręczny, np. przez `5gon`.
@@ -25,10 +29,23 @@ W `/etc/fm350-rndis.conf`:
 
 ```text
 FAILOVER_ENABLE="yes"
-FAILOVER_AFTER_SECONDS="60"
-FAILOVER_CHECK_INTERVAL="15"
+FAILOVER_CHECK_INTERVAL="20"
+FAILOVER_FAIL_COUNT="3"
 FAILOVER_PING_TIMEOUT="2"
 ```
+
+## Logowanie
+
+Przy normalnej pracy i poprawnym 5G watchdog nie dopisuje wpisów dla kolejnych testów PASS.
+
+Jedna typowa awaria generuje tylko:
+
+```text
+SUSPECT ... count=1/3
+FAILOVER ... failed_checks=3 ...
+```
+
+Jeżeli nie istnieje alternatywna trasa domyślna, failover jest blokowany i zapisywany jest pojedynczy `FAILOVER_BLOCKED` dla danego incydentu.
 
 ## Usługa
 
