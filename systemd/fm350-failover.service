@@ -1,0 +1,13 @@
+[Unit]
+Description=FM350 one-way failover watchdog
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/fm350-failover
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
