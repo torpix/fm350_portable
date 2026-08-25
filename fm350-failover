@@ -1,0 +1,155 @@
+#!/bin/sh
+set -eu
+
+CONFIG=/etc/fm350-rndis.conf
+LOG=/tmp/fm350-failover.log
+
+log() {
+    msg="$(date '+%F %T') fm350-failover: $*"
+    printf '%s\n' "$msg" >> "$LOG"
+    printf '%s\n' "$msg"
+}
+
+load_config() {
+    if [ -r "$CONFIG" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG"
+    fi
+
+    FM_IF=${FM_IF:-auto}
+    FAILOVER_ENABLE=${FAILOVER_ENABLE:-yes}
+    FAILOVER_CHECK_INTERVAL=${FAILOVER_CHECK_INTERVAL:-20}
+    FAILOVER_FAIL_COUNT=${FAILOVER_FAIL_COUNT:-3}
+    FAILOVER_PING_TIMEOUT=${FAILOVER_PING_TIMEOUT:-2}
+}
+
+detect_fm_if() {
+    if [ "$FM_IF" != "auto" ] && [ -d "/sys/class/net/$FM_IF" ]; then
+        printf '%s\n' "$FM_IF"
+        return 0
+    fi
+
+    detected=$(fm350-detect 2>/dev/null || true)
+    detected_if=$(printf '%s\n' "$detected" | awk -F= '$1=="FM_IF"{print $2}')
+    [ -n "$detected_if" ] || return 1
+    [ -d "/sys/class/net/$detected_if" ] || return 1
+    printf '%s\n' "$detected_if"
+}
+
+fm350_is_default() {
+    iface=$1
+    ip route show default dev "$iface" 2>/dev/null | grep -q '^default '
+}
+
+fallback_route_exists() {
+    iface=$1
+    ip route show default 2>/dev/null | awk -v dev="$iface" '
+        $1 == "default" {
+            found_dev = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev" && i < NF) {
+                    found_dev = $(i + 1)
+                    break
+                }
+            }
+            if (found_dev != "" && found_dev != dev) {
+                found = 1
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+health_ok() {
+    iface=$1
+
+    ping -I "$iface" -c 1 -W "$FAILOVER_PING_TIMEOUT" 1.1.1.1 >/dev/null 2>&1 && return 0
+    ping -I "$iface" -c 1 -W "$FAILOVER_PING_TIMEOUT" 9.9.9.9 >/dev/null 2>&1 && return 0
+
+    return 1
+}
+
+drop_fm350_default_route() {
+    iface=$1
+
+    while ip route show default dev "$iface" 2>/dev/null | grep -q '^default '; do
+        ip route del default dev "$iface" 2>/dev/null || break
+    done
+    ip route flush cache 2>/dev/null || true
+}
+
+mkdir -p /tmp
+fail_count=0
+last_iface=""
+blocked_logged=0
+
+log "START one-way failover enabled; check=20s fail_count=3; no automatic return to FM350"
+
+while :; do
+    load_config
+
+    if [ "$FAILOVER_ENABLE" != "yes" ]; then
+        fail_count=0
+        blocked_logged=0
+        sleep 60
+        continue
+    fi
+
+    iface=$(detect_fm_if || true)
+    if [ -z "$iface" ]; then
+        fail_count=0
+        blocked_logged=0
+        sleep "$FAILOVER_CHECK_INTERVAL"
+        continue
+    fi
+
+    if [ "$iface" != "$last_iface" ]; then
+        last_iface=$iface
+        fail_count=0
+        blocked_logged=0
+    fi
+
+    if ! fm350_is_default "$iface"; then
+        fail_count=0
+        blocked_logged=0
+        sleep "$FAILOVER_CHECK_INTERVAL"
+        continue
+    fi
+
+    if health_ok "$iface"; then
+        fail_count=0
+        blocked_logged=0
+        sleep "$FAILOVER_CHECK_INTERVAL"
+        continue
+    fi
+
+    fail_count=$((fail_count + 1))
+
+    if [ "$fail_count" -eq 1 ]; then
+        log "SUSPECT iface=$iface health_check_failed count=1/${FAILOVER_FAIL_COUNT}"
+    fi
+
+    if [ "$fail_count" -lt "$FAILOVER_FAIL_COUNT" ]; then
+        sleep "$FAILOVER_CHECK_INTERVAL"
+        continue
+    fi
+
+    if ! fallback_route_exists "$iface"; then
+        if [ "$blocked_logged" -eq 0 ]; then
+            log "FAILOVER_BLOCKED iface=$iface reason=no_alternate_default_route"
+            blocked_logged=1
+        fi
+        sleep "$FAILOVER_CHECK_INTERVAL"
+        continue
+    fi
+
+    drop_fm350_default_route "$iface"
+    route_after=$(ip route get 1.1.1.1 2>/dev/null | head -n 1 || true)
+    log "FAILOVER iface=$iface failed_checks=$fail_count action=drop_fm350_default_route route_after=$route_after"
+
+    # Deliberately no automatic return to FM350. A later manual 5gon may
+    # restore the FM350 default route; the watchdog will then monitor it again.
+    fail_count=0
+    blocked_logged=0
+    sleep "$FAILOVER_CHECK_INTERVAL"
+done
