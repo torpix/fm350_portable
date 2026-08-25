@@ -145,8 +145,8 @@ if not test -e "$CONFIG"
         "AUTOCONNECT=\"$AUTOCONNECT\"" \
         'DISABLE_MODEMMANAGER_FOR_FM350="yes"' \
         'FAILOVER_ENABLE="yes"' \
-        'FAILOVER_AFTER_SECONDS="60"' \
-        'FAILOVER_CHECK_INTERVAL="15"' \
+        'FAILOVER_CHECK_INTERVAL="20"' \
+        'FAILOVER_FAIL_COUNT="3"' \
         'FAILOVER_PING_TIMEOUT="2"' \
         >"$CONFIG"
 end
@@ -162,8 +162,8 @@ if test -r "$CONFIG"
     end
 
     grep -q '^FAILOVER_ENABLE=' "$CONFIG"; or printf 'FAILOVER_ENABLE="yes"\n' >>"$CONFIG"
-    grep -q '^FAILOVER_AFTER_SECONDS=' "$CONFIG"; or printf 'FAILOVER_AFTER_SECONDS="60"\n' >>"$CONFIG"
-    grep -q '^FAILOVER_CHECK_INTERVAL=' "$CONFIG"; or printf 'FAILOVER_CHECK_INTERVAL="15"\n' >>"$CONFIG"
+    grep -q '^FAILOVER_CHECK_INTERVAL=' "$CONFIG"; or printf 'FAILOVER_CHECK_INTERVAL="20"\n' >>"$CONFIG"
+    grep -q '^FAILOVER_FAIL_COUNT=' "$CONFIG"; or printf 'FAILOVER_FAIL_COUNT="3"\n' >>"$CONFIG"
     grep -q '^FAILOVER_PING_TIMEOUT=' "$CONFIG"; or printf 'FAILOVER_PING_TIMEOUT="2"\n' >>"$CONFIG"
 
     set -l detected_if (awk -F= '$1=="FM_IF"{gsub(/"/,"",$2); print $2}' "$CONFIG")
@@ -187,6 +187,6 @@ systemctl enable --now fm350-failover.service
 
 echo "Installed FM350 portable package."
 echo "Config: $CONFIG"
-echo "Failover: one-way FM350 -> existing LAN/default route after ~60 seconds of failed health checks."
+echo "Failover: one-way FM350 -> existing LAN/default route after 3 consecutive failed checks at 20-second intervals."
 echo "No automatic return to FM350 is configured."
 echo "Next: fm350-detect; fm350info; sudo nmcli connection up FM350_RNDIS"
