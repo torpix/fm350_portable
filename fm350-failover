@@ -18,8 +18,8 @@ load_config() {
 
     FM_IF=${FM_IF:-auto}
     FAILOVER_ENABLE=${FAILOVER_ENABLE:-yes}
-    FAILOVER_AFTER_SECONDS=${FAILOVER_AFTER_SECONDS:-60}
-    FAILOVER_CHECK_INTERVAL=${FAILOVER_CHECK_INTERVAL:-15}
+    FAILOVER_CHECK_INTERVAL=${FAILOVER_CHECK_INTERVAL:-20}
+    FAILOVER_FAIL_COUNT=${FAILOVER_FAIL_COUNT:-3}
     FAILOVER_PING_TIMEOUT=${FAILOVER_PING_TIMEOUT:-2}
 }
 
@@ -79,74 +79,77 @@ drop_fm350_default_route() {
 }
 
 mkdir -p /tmp
-first_failure=0
+fail_count=0
 last_iface=""
+blocked_logged=0
 
-log "START one-way failover enabled; no automatic return to FM350"
+log "START one-way failover enabled; check=20s fail_count=3; no automatic return to FM350"
 
 while :; do
     load_config
 
     if [ "$FAILOVER_ENABLE" != "yes" ]; then
-        first_failure=0
+        fail_count=0
+        blocked_logged=0
         sleep 60
         continue
     fi
 
     iface=$(detect_fm_if || true)
     if [ -z "$iface" ]; then
-        first_failure=0
+        fail_count=0
+        blocked_logged=0
         sleep "$FAILOVER_CHECK_INTERVAL"
         continue
     fi
 
     if [ "$iface" != "$last_iface" ]; then
-        log "FM350 interface detected: $iface"
         last_iface=$iface
+        fail_count=0
+        blocked_logged=0
     fi
 
     if ! fm350_is_default "$iface"; then
-        first_failure=0
+        fail_count=0
+        blocked_logged=0
         sleep "$FAILOVER_CHECK_INTERVAL"
         continue
     fi
 
     if health_ok "$iface"; then
-        if [ "$first_failure" -ne 0 ]; then
-            log "HEALTH_RECOVERED iface=$iface before failover threshold"
-        fi
-        first_failure=0
+        fail_count=0
+        blocked_logged=0
         sleep "$FAILOVER_CHECK_INTERVAL"
         continue
     fi
 
-    now=$(date +%s)
-    if [ "$first_failure" -eq 0 ]; then
-        first_failure=$now
-        log "HEALTH_FAIL iface=$iface grace=${FAILOVER_AFTER_SECONDS}s started"
+    fail_count=$((fail_count + 1))
+
+    if [ "$fail_count" -eq 1 ]; then
+        log "SUSPECT iface=$iface health_check_failed count=1/${FAILOVER_FAIL_COUNT}"
     fi
 
-    elapsed=$((now - first_failure))
-    if [ "$elapsed" -lt "$FAILOVER_AFTER_SECONDS" ]; then
-        log "HEALTH_FAIL iface=$iface elapsed=${elapsed}s/${FAILOVER_AFTER_SECONDS}s"
+    if [ "$fail_count" -lt "$FAILOVER_FAIL_COUNT" ]; then
         sleep "$FAILOVER_CHECK_INTERVAL"
         continue
     fi
 
     if ! fallback_route_exists "$iface"; then
-        log "FAILOVER_BLOCKED iface=$iface reason=no_alternate_default_route"
+        if [ "$blocked_logged" -eq 0 ]; then
+            log "FAILOVER_BLOCKED iface=$iface reason=no_alternate_default_route"
+            blocked_logged=1
+        fi
         sleep "$FAILOVER_CHECK_INTERVAL"
         continue
     fi
 
-    log "FAILOVER_TRIGGER iface=$iface elapsed=${elapsed}s action=drop_fm350_default_route"
     drop_fm350_default_route "$iface"
-
     route_after=$(ip route get 1.1.1.1 2>/dev/null | head -n 1 || true)
-    log "FAILOVER_DONE route_after=$route_after"
+    log "FAILOVER iface=$iface failed_checks=$fail_count action=drop_fm350_default_route route_after=$route_after"
 
     # Deliberately no automatic return to FM350. A later manual 5gon may
     # restore the FM350 default route; the watchdog will then monitor it again.
-    first_failure=0
+    fail_count=0
+    blocked_logged=0
     sleep "$FAILOVER_CHECK_INTERVAL"
 done
