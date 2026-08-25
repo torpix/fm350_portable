@@ -62,24 +62,26 @@ function install_pkg
     end
 end
 
-set -l deps atinout ethtool usbutils networkmanager iproute2
+set -l deps atinout ethtool usbutils networkmanager iproute2 iputils
 if command -q apt
-    set deps atinout ethtool usbutils network-manager iproute2
+    set deps atinout ethtool usbutils network-manager iproute2 iputils-ping
 end
 
 echo "Installing dependencies: $deps"
 install_pkg $deps
 
-mkdir -p /usr/local/sbin /usr/local/bin /etc/NetworkManager/dispatcher.d /etc/udev/rules.d
+mkdir -p /usr/local/sbin /usr/local/bin /etc/NetworkManager/dispatcher.d /etc/udev/rules.d /etc/systemd/system
 
 for item in \
     /usr/local/sbin/fm350-detect \
     /usr/local/sbin/fm350-connect \
     /usr/local/sbin/fm350-disconnect \
+    /usr/local/sbin/fm350-failover \
     /usr/local/bin/fm350info \
     /etc/NetworkManager/dispatcher.d/90-fm350-rndis \
     /etc/NetworkManager/dispatcher.d/95-fm350-dns-guard \
     /etc/udev/rules.d/78-fm350-modemmanager.rules \
+    /etc/systemd/system/fm350-failover.service \
     $CONFIG
     backup_if_exists $item
 end
@@ -87,9 +89,11 @@ end
 install -m 0755 "$SRC_DIR/fm350-detect" /usr/local/sbin/fm350-detect
 install -m 0755 "$SRC_DIR/fm350-connect" /usr/local/sbin/fm350-connect
 install -m 0755 "$SRC_DIR/fm350-disconnect" /usr/local/sbin/fm350-disconnect
+install -m 0755 "$SRC_DIR/fm350-failover" /usr/local/sbin/fm350-failover
 install -m 0755 "$SRC_DIR/fm350info" /usr/local/bin/fm350info
 install -m 0755 "$SRC_DIR/dispatcher/90-fm350-rndis" /etc/NetworkManager/dispatcher.d/90-fm350-rndis
 install -m 0755 "$SRC_DIR/dispatcher/95-fm350-dns-guard" /etc/NetworkManager/dispatcher.d/95-fm350-dns-guard
+install -m 0644 "$SRC_DIR/systemd/fm350-failover.service" /etc/systemd/system/fm350-failover.service
 
 printf '%s\n' \
     '# Keep ModemManager away from Fibocom FM350-GL/Dell DW5931e in USB RNDIS+AT modes only.' \
@@ -140,6 +144,10 @@ if not test -e "$CONFIG"
         'ROUTE_METRIC="100"' \
         "AUTOCONNECT=\"$AUTOCONNECT\"" \
         'DISABLE_MODEMMANAGER_FOR_FM350="yes"' \
+        'FAILOVER_ENABLE="yes"' \
+        'FAILOVER_AFTER_SECONDS="60"' \
+        'FAILOVER_CHECK_INTERVAL="15"' \
+        'FAILOVER_PING_TIMEOUT="2"' \
         >"$CONFIG"
 end
 
@@ -152,6 +160,12 @@ if test -r "$CONFIG"
     else
         printf 'MANAGE_DNS="%s"\n' "$MANAGE_DNS" >>"$CONFIG"
     end
+
+    grep -q '^FAILOVER_ENABLE=' "$CONFIG"; or printf 'FAILOVER_ENABLE="yes"\n' >>"$CONFIG"
+    grep -q '^FAILOVER_AFTER_SECONDS=' "$CONFIG"; or printf 'FAILOVER_AFTER_SECONDS="60"\n' >>"$CONFIG"
+    grep -q '^FAILOVER_CHECK_INTERVAL=' "$CONFIG"; or printf 'FAILOVER_CHECK_INTERVAL="15"\n' >>"$CONFIG"
+    grep -q '^FAILOVER_PING_TIMEOUT=' "$CONFIG"; or printf 'FAILOVER_PING_TIMEOUT="2"\n' >>"$CONFIG"
+
     set -l detected_if (awk -F= '$1=="FM_IF"{gsub(/"/,"",$2); print $2}' "$CONFIG")
     if test -n "$detected_if"; and test "$detected_if" != auto
         nmcli connection modify FM350_RNDIS connection.interface-name "$detected_if" 2>/dev/null; or true
@@ -168,6 +182,11 @@ if test -r "$CONFIG"
     end
 end
 
+systemctl daemon-reload
+systemctl enable --now fm350-failover.service
+
 echo "Installed FM350 portable package."
 echo "Config: $CONFIG"
+echo "Failover: one-way FM350 -> existing LAN/default route after ~60 seconds of failed health checks."
+echo "No automatic return to FM350 is configured."
 echo "Next: fm350-detect; fm350info; sudo nmcli connection up FM350_RNDIS"
